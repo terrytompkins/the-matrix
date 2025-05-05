@@ -37,6 +37,7 @@ Requirements excerpt (put the same list in *requirements.txt*):
 
 Environment variables:
     OPENAI_API_KEY        # for GPT‑4o or other OpenAI models
+    GROK_API_KEY          # for GrokQL
     ANTHROPIC_API_KEY     # for Claude models
     GOOGLE_API_KEY        # if using Gemini
 """
