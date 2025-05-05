@@ -1,4 +1,10 @@
 streamlit>=1.35
 python-dotenv>=1.0
+rapidfuzz
+tabulate
+langchain
+langchain-openai
+langchain_anthropic
 langchain-groq
+
 

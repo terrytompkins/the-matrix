@@ -1,5 +1,5 @@
 import os, streamlit as st
-from app.research_agent import run_pipeline   # we’ll wrap main() into a function
+from research_agent import run_pipeline   # we’ll wrap main() into a function
 
 # --- Page config -----------------------------------------------------------
 st.set_page_config(page_title="Product Research Bot", layout="wide")
