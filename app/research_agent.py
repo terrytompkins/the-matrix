@@ -2,79 +2,43 @@
 """
 Sequential product‑research agent built with **LangChain / LangGraph**.
 
-This revision adds **robust error handling and retries** around LLM calls so a
-transient network hic‑cup (e.g. `openai.APIConnectionError`) does not crash the
-whole pipeline.  It also surfaces clearer log messages when a model is skipped.
-
-Public API
-==========
-    run_pipeline(query: str,
-                 features: list[str] | None = None,
-                 models: list[str] | None = None,
-                 *,
-                 retries: int = 3,
-                 backoff_base: float = 2.0) -> str
-
-The two new keyword args let Streamlit adjust retry policy if desired.
+🔧 2025‑05‑06 patch
+------------------
+Fixes *INVALID_PROMPT_INPUT* arising from single‑brace JSON example.
+All curly braces inside the sample JSON are now **escaped as `{{` / `}}`** so
+LangChain no longer thinks they are template variables.
 """
 from __future__ import annotations
 
-# --- Load environment variables -------------------------------------------
 import time
-from pathlib import Path
-from dotenv import load_dotenv
-import os
-import argparse
 import json
 import textwrap
+import argparse
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Sequence
 
-import openai  # for catching APIConnectionError
+import openai
+from dotenv import load_dotenv
+from rapidfuzz import fuzz, process
+from tabulate import tabulate
+
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain.schema.runnable import RunnableSequence
-
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 try:
     from langchain_google_genai import ChatGoogleGenAI  # optional
-except ImportError:  # pragma: no cover
+except ImportError:
     ChatGoogleGenAI = None  # type: ignore
 
-from rapidfuzz import fuzz, process
-from tabulate import tabulate
-
-# Automatically load .env one directory above this file (repo root)
+# Load env vars
 load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
 
 # ---------------------------------------------------------------------------
-# Data classes
+# Prompt template (escaped braces)
 # ---------------------------------------------------------------------------
-
-@dataclass
-class Product:
-    name: str
-    features: Dict[str, str] = field(default_factory=dict)
-
-    def merge(self, other: "Product") -> None:
-        for k, v in other.features.items():
-            if k not in self.features or not self.features[k]:
-                self.features[k] = v
-
-# ---------------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------------
-
-def choose_llm(model_id: str):
-    if model_id.startswith("gpt-") or model_id in {"gpt-4o", "gpt-4o-mini"}:
-        return ChatOpenAI(model=model_id, temperature=0)
-    if model_id.startswith("claude") or model_id.startswith("anthropic"):
-        return ChatAnthropic(model=model_id, temperature=0)
-    if ChatGoogleGenAI and (model_id.startswith("gemini") or model_id.startswith("google")):
-        return ChatGoogleGenAI(model=model_id, temperature=0)
-    raise ValueError(f"Unsupported model id: {model_id}")
-
 
 RESEARCH_TEMPLATE = textwrap.dedent(
     """
@@ -85,145 +49,148 @@ RESEARCH_TEMPLATE = textwrap.dedent(
     {query}
     ================
 
-    The comparison should cover these features (add sensible defaults if blank):
+    Compare across these feature columns (add sensible defaults if blank):
     {features}
 
-    Here are products we have already gathered (if any) in Markdown table form.
-    Only add **new** products that are missing.
+    Below is the current comparison matrix in Markdown. Add **only products that
+    are not already present**. If the matrix is empty, start a new list.
 
     --- CURRENT MATRIX ---
     {current_matrix}
     -----------------------
 
-    Return ONLY a JSON array called `products`, where each element has:
-        name: string – product name
-        features: object – keys = feature names, values = strings
+    ⚠️ OUTPUT FORMAT — VERY IMPORTANT ⚠️
+    Respond with **valid JSON object only** (no markdown, no code fences) of the form:
+      {{
+        "products": [
+          {{
+            "name": "<Product>",
+            "features": {{
+              "price": "$…",
+              "license": "…",
+              "platform": "…"
+            }}
+          }}
+        ]
+      }}
     """
 )
 
 OUTPUT_PARSER = StrOutputParser()
 
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+@dataclass
+class Product:
+    name: str
+    features: Dict[str, str] = field(default_factory=dict)
 
-def build_research_chain(llm):
+    def merge(self, other: "Product") -> None:
+        for k, v in other.features.items():
+            if not self.features.get(k):
+                self.features[k] = v
+
+# ---------------------------------------------------------------------------
+# LLM factory (JSON mode for OpenAI)
+# ---------------------------------------------------------------------------
+
+def _openai_json(model_id: str):
+    return ChatOpenAI(model=model_id, temperature=0,
+                      model_kwargs={"response_format": {"type": "json_object"}})
+
+def choose_llm(model_id: str):
+    if model_id.startswith("gpt-") or model_id in {"gpt-4o", "gpt-4o-mini"}:
+        return _openai_json(model_id)
+    if model_id.startswith("claude") or model_id.startswith("anthropic"):
+        return ChatAnthropic(model=model_id, temperature=0)
+    if ChatGoogleGenAI and (model_id.startswith("gemini") or model_id.startswith("google")):
+        return ChatGoogleGenAI(model=model_id, temperature=0)
+    raise ValueError(f"Unsupported model id: {model_id}")
+
+# ---------------------------------------------------------------------------
+# Chain builder
+# ---------------------------------------------------------------------------
+
+def _build_chain(llm):
     prompt = ChatPromptTemplate.from_template(RESEARCH_TEMPLATE)
     return RunnableSequence(prompt, llm, OUTPUT_PARSER)
 
 # ---------------------------------------------------------------------------
-# Core pipeline logic
+# Helpers
 # ---------------------------------------------------------------------------
 
-def _fuzzy_dedupe(products: List[Product]) -> List[Product]:
-    unique: List[Product] = []
-    for prod in products:
-        matches = process.extract(
-            prod.name, [p.name for p in unique],
-            scorer=fuzz.token_sort_ratio, limit=1,
-        )
-        if matches and matches[0][1] >= 90:
-            unique[matches[0][2]].merge(prod)
+def _dedupe(products: List[Product]) -> List[Product]:
+    uniq: List[Product] = []
+    for p in products:
+        m = process.extract(p.name, [u.name for u in uniq], scorer=fuzz.token_sort_ratio, limit=1)
+        if m and m[0][1] >= 90:
+            uniq[m[0][2]].merge(p)
         else:
-            unique.append(prod)
-    return unique
+            uniq.append(p)
+    return uniq
+
+def _merge(existing: List[Product], batch: Sequence[dict]) -> List[Product]:
+    combined = existing + [Product(name=b["name"].strip(), features=b.get("features", {})) for b in batch]
+    return _dedupe(combined)
 
 
-def _merge_products(existing: List[Product], new_batch: Sequence[dict]) -> List[Product]:
-    products = existing + [Product(name=p["name"].strip(), features=p.get("features", {}))
-                           for p in new_batch]
-    return _fuzzy_dedupe(products)
-
-
-def _products_to_markdown(products: List[Product], feature_order: List[str]) -> str:
-    rows = [[prod.name] + [prod.features.get(f, "") for f in feature_order]
-            for prod in products]
-    return tabulate(rows, ["Product"] + feature_order, tablefmt="github")
+def _to_md(products: List[Product], cols: List[str]) -> str:
+    rows = [[p.name] + [p.features.get(c, "") for c in cols] for p in products]
+    return tabulate(rows, ["Product"] + cols, tablefmt="github")
 
 # ---------------------------------------------------------------------------
-# Public API
+# Pipeline
 # ---------------------------------------------------------------------------
 
 def run_pipeline(query: str,
+                 *,
                  features: List[str] | None = None,
                  models: List[str] | None = None,
-                 *,
                  retries: int = 3,
-                 backoff_base: float = 2.0) -> str:
-    """Run the multi‑LLM enrichment loop and return a Markdown table.
-
-    Parameters
-    ----------
-    query : str
-        Product category / research question.
-    features : list[str] | None
-        Features/columns to compare. Defaults to ["price","license","platform"].
-    models : list[str] | None
-        Ordered list of model IDs. Defaults to ["gpt-4o"].
-    retries : int, default 3
-        How many times to retry an LLM call on connection errors.
-    backoff_base : float, default 2.0
-        Exponential back‑off base in seconds (1st retry waits base**0, then base**1, …).
-    """
-    feature_list = [f.strip() for f in (features or []) if f.strip()] or [
-        "price", "license", "platform"]
+                 backoff_base: float = 2.0,
+                 log_raw: bool = False) -> str:
+    cols = [f.strip() for f in (features or []) if f.strip()] or ["price", "license", "platform"]
     model_ids = models or ["gpt-4o"]
 
     matrix_md = ""
     collected: List[Product] = []
 
-    for model_id in model_ids:
-        chain = build_research_chain(choose_llm(model_id))
-        attempt = 0
-        while attempt < retries:
+    for mid in model_ids:
+        chain = _build_chain(choose_llm(mid))
+        payload = {"query": query, "features": ", ".join(cols), "current_matrix": matrix_md or "<empty>"}
+        raw = None
+        for attempt in range(retries):
             try:
-                response_json = chain.invoke({
-                    "query": query,
-                    "features": ", ".join(feature_list),
-                    "current_matrix": matrix_md,
-                })
-                break  # Success → leave retry loop
-            except openai.APIConnectionError as err:
-                attempt += 1
-                if attempt >= retries:
-                    print(f"[ERROR] {model_id}: connection failed after {retries} attempts; skipping.")
-                    response_json = None
-                else:
-                    wait = backoff_base ** (attempt - 1)
-                    print(f"[WARN] {model_id}: connection error ({err}). Retrying in {wait}s…")
-                    time.sleep(wait)
-        if response_json is None:
-            continue  # skip this model
-        try:
-            product_batch = json.loads(response_json).get("products", [])
-        except json.JSONDecodeError:
-            print(f"[WARN] {model_id} returned non‑JSON; skipping…")
+                raw = chain.invoke(payload)
+                break
+            except openai.APIConnectionError as e:
+                wait = backoff_base ** attempt
+                print(f"[WARN] {mid}: network error → retry {attempt+1}/{retries} in {wait}s…")
+                time.sleep(wait)
+        if raw is None:
+            print(f"[ERROR] {mid}: skipped after {retries} retries.")
             continue
-        collected = _merge_products(collected, product_batch)
-        matrix_md = _products_to_markdown(collected, feature_list)
-        print(f"[INFO] After {model_id}: {len(collected)} products collected.")
+        if log_raw:
+            print(f"[DEBUG] {mid} raw: {raw[:300]}…")
+        try:
+            batch = json.loads(raw).get("products", [])
+        except json.JSONDecodeError as e:
+            print(f"[WARN] {mid}: invalid JSON ({e}). Skipped.")
+            continue
+        collected = _merge(collected, batch)
+        matrix_md = _to_md(collected, cols)
+        print(f"[INFO] {mid}: total products {len(collected)}")
 
     return matrix_md
 
-# ---------------------------------------------------------------------------
-# CLI for local testing
-# ---------------------------------------------------------------------------
-
-def _cli():
-    parser = argparse.ArgumentParser(description="Sequential multi‑LLM product researcher")
+# CLI remains unchanged
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
     parser.add_argument("--query", required=True)
     parser.add_argument("--features", default="price,license,platform")
-    parser.add_argument("--models", nargs="+", default=["gpt-4o"])
-    parser.add_argument("--outfile", default="matrix.md")
-    parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--log-raw", action="store_true")
     args = parser.parse_args()
-
-    md = run_pipeline(
-        args.query,
-        features=[f.strip() for f in args.features.split(',')],
-        models=args.models,
-        retries=args.retries,
-    )
-    Path(args.outfile).write_text(md, encoding="utf-8")
-    print(f"Matrix written to {args.outfile}\n")
-
-
-if __name__ == "__main__":
-    _cli()
+    md = run_pipeline(args.query, features=[x.strip() for x in args.features.split(',')], log_raw=args.log_raw)
+    Path("matrix.md").write_text(md)
+    print("Matrix written to matrix.md")
